@@ -1,0 +1,107 @@
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+
+# identify the build file extension for dotnet core projects
+# 
+
+name: .NET Core CD
+
+on: [push]
+
+env:
+  WEBAPP: AmpUpApi-QA          # must exist already
+  GROUP: RSG-QA                # must exist already
+  ACCOUNT: ampsysstoreqa       # Does not have to exist, this will be created for you
+  CONTAINER: ampsysstoreqa     # Does not have to exist, this will be created for you
+  EXPIRY_TIME: 10 minutes      # how long the artifact will exist in the storage bucket
+  # set up environment variables to match what we have the the build.gradle file
+  GPR_USER: 'paulhethmon'
+  GPR_KEY: ${{ secrets.PAT_FOR_GPR_ACCESS }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+      - name: Setup .NET Core
+        uses: actions/setup-dotnet@v1
+        with:
+          dotnet-version: 3.1.101
+          distribution: 'adopt'
+      - name: Install dependendcies # make sure the wrapper is an official release version
+        uses: dotnet restore #dotnet restore/wrapper-validation-action@e6e38bacfdf1a337459f332974bb2327a31aaf4b # use dotnet restore to download and restore packages
+      - name: Build with dotnet
+        run:  dotnet build #./gradlew clean build azurejar #instead of gradle here, use dotnet build, there might be additional build options, please verify
+      - name: Upload artifact for deployment jobs
+        uses: actions/upload-artifact@v2
+        with:
+          name: app
+          path: build/Ampupapi.jar #find the file name generated after dotnet build and change the path attribute here, dll or exe and what is the file path
+          retention-days: 10
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Step Info
+        run: echo "Downloading artifact for publish step ..."
+      - name: Download artifact
+        uses: actions/download-artifact@v2
+        with:
+          name: app
+
+      - name: Display structure of downloaded files
+        run: ls -R #ls command to list the files in the directory
+
+#      - name: Zip the jar file
+#        uses: montudor/action-zip@v1
+#        with:
+#          args: zip -qq publicrecords.zip publicrecords.jar
+#
+#      - name: List the zip file contents
+#        uses: montudor/action-zip@v1
+#        with:
+#          args: unzip -l publicrecords.zip
+
+#        uses: papeloto/action-zip@v1
+#        with:
+#          files: publicrecords*.jar
+#          dest: app.zip
+
+      - name: Set SAS token expiration
+        run: echo "expiry=`date -u -d "$EXPIRY_TIME" '+%Y-%m-%dT%H:%MZ'`" >> $GITHUB_ENV
+
+# the Azure CLI command set is actually sent to an Azure docker container to run, so their context is
+# Azure and not Github
+      - name: Azure CLI script
+        uses: azure/CLI@v1
+        with:
+          azcliversion: 2.27.1
+          inlineScript: |
+            az extension add --name webapp
+            az storage account create   -n $ACCOUNT   -g $GROUP -l canadacentral
+            az storage container create -n $CONTAINER --account-name $ACCOUNT
+            ls -l
+            echo "Uploading blob next ..."
+            az storage blob upload      -f ./publicrecords.jar    --account-name $ACCOUNT -c $CONTAINER -n $ACCOUNT
+            echo "List blob contents ..."
+            az storage blob list --container-name $CONTAINER --account-name $ACCOUNT
+            JAR_URL=$(az storage blob generate-sas --full-uri --permissions r --expiry ${{ env.expiry }} --account-name $ACCOUNT -c $CONTAINER -n $ACCOUNT | xargs)
+            echo "unique sas url for jar file:"
+            echo $JAR_URL
+            echo "Deploying webapp via storage bucket ..."
+            az webapp deploy --name $WEBAPP --resource-group $GROUP --type jar --src-url  $JAR_URL --async false
+            echo "Cleaning up storage resources ..."
+            az storage container delete -n $CONTAINER --account-name $ACCOUNT
+            az storage account delete --name $ACCOUNT --resource-group $GROUP --yes
+
+# -- type (jar, lib, war, zip,   )
